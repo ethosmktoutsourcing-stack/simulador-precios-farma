@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 
-# Configuración de la página (Pestaña del navegador)
+# Configuración de la página
 st.set_page_config(page_title="Estrategia de Precios Farma", page_icon="💊", layout="wide")
 
 def limpiar_precio(valor):
@@ -15,7 +15,6 @@ def limpiar_precio(valor):
 
 @st.cache_data
 def procesar_csv(archivo):
-    # Leemos el archivo subido
     df = pd.read_csv(archivo, skiprows=2)
     df.columns = ['Vacio', 'DESCRIPCION', 'LABORATORIO', 'FARMATODO', 'COBECA', 'NENA']
     df = df.drop(columns=['Vacio'])
@@ -23,7 +22,6 @@ def procesar_csv(archivo):
     df['FARMATODO'] = df['FARMATODO'].apply(limpiar_precio)
     df['COBECA'] = df['COBECA'].apply(limpiar_precio)
     df['NENA'] = df['NENA'].apply(limpiar_precio)
-    
     df['COSTO_MINIMO'] = df[['COBECA', 'NENA']].min(axis=1)
     
     def elegir_proveedor(row):
@@ -33,17 +31,19 @@ def procesar_csv(archivo):
         return "COBECA"
         
     df['MEJOR_PROVEEDOR'] = df.apply(elegir_proveedor, axis=1)
+    # Crear una columna combinada para el buscador
+    df['OPCION'] = df.apply(lambda x: f"{x['DESCRIPCION']} (Lab: {x['LABORATORIO']})", axis=1)
     return df
 
 # --- INTERFAZ GRÁFICA ---
-st.title("💊 Simulador de Precios vs Farmatodo")
+st.title("💊 Simulador de Precios de Portafolio vs Farmatodo")
 
 # --- FIRMA DEL DESARROLLADOR ---
 st.markdown("#### Desarrollado por: **Econ. Pedro Abreu**")
 st.caption("📊 *Consultor de Implementación y Estrategia basada en Datos*")
-st.markdown("---") # Línea divisoria elegante
+st.markdown("---")
 
-st.markdown("Sube tu lista de precios, busca el fármaco y calcula tu rentabilidad al instante.")
+st.markdown("Sube tu lista, selecciona **múltiples fármacos**, ajusta sus cantidades y descubre el impacto total en tu rentabilidad.")
 
 # 1. Subida del archivo
 archivo_subido = st.file_uploader("Sube tu archivo CSV de la lista de precios", type=["csv"])
@@ -51,83 +51,127 @@ archivo_subido = st.file_uploader("Sube tu archivo CSV de la lista de precios", 
 if archivo_subido is not None:
     df = procesar_csv(archivo_subido)
     
-    # 2. Buscador integrado
-    st.subheader("🔍 Buscar Medicamento")
-    busqueda = st.text_input("Escribe el nombre del medicamento (Ej. Losartan, Amlodipina):").upper()
+    # Filtrar solo los que tienen datos válidos (que tengan costo y precio farmatodo)
+    df_validos = df.dropna(subset=['COSTO_MINIMO', 'FARMATODO']).copy()
+    opciones_validas = df_validos['OPCION'].tolist()
     
-    if busqueda:
-        resultados = df[df['DESCRIPCION'].str.contains(busqueda, na=False)]
+    # 2. Buscador Múltiple
+    st.subheader("🛒 Arma tu pedido (Selecciona hasta 10 medicamentos)")
+    seleccionados = st.multiselect(
+        "Busca y selecciona los fármacos:", 
+        opciones_validas, 
+        max_selections=10,
+        help="Puedes escribir para buscar y seleccionar varios de la lista."
+    )
+    
+    if seleccionados:
+        st.markdown("### ⚙️ Configura tu pedido")
+        st.info("💡 **Tip:** Haz doble clic en las columnas de **Cantidad** y **Margen (%)** para editarlas a tu gusto.")
         
-        if resultados.empty:
-            st.warning("No se encontró ningún medicamento con ese nombre.")
-        else:
-            # Crear una lista de opciones para el usuario
-            opciones = resultados.apply(lambda x: f"{x['DESCRIPCION']} (Lab: {x['LABORATORIO']})", axis=1).tolist()
-            seleccion = st.selectbox("Selecciona el medicamento exacto:", opciones)
+        # Obtener los datos de los seleccionados
+        df_sel = df_validos[df_validos['OPCION'].isin(seleccionados)].copy()
+        
+        # Crear un dataframe para que el usuario lo edite en pantalla
+        tabla_edicion = pd.DataFrame({
+            'Medicamento': df_sel['DESCRIPCION'].values,
+            'Mejor Proveedor': df_sel['MEJOR_PROVEEDOR'].values,
+            'Costo Unit. ($)': df_sel['COSTO_MINIMO'].values,
+            'Precio Farmatodo ($)': df_sel['FARMATODO'].values,
+            'Cantidad': [30] * len(df_sel),         # Valor por defecto: 30
+            'Margen Deseado (%)': [30.0] * len(df_sel) # Valor por defecto: 30%
+        })
+        
+        # Mostrar tabla interactiva (bloqueando la edición de las columnas de solo lectura)
+        df_editado = st.data_editor(
+            tabla_edicion,
+            disabled=['Medicamento', 'Mejor Proveedor', 'Costo Unit. ($)', 'Precio Farmatodo ($)'],
+            hide_index=True,
+            use_container_width=True
+        )
+        
+        # Botón de calcular
+        if st.button("🚀 Calcular Estrategia Global", type="primary"):
             
-            # Obtener los datos del medicamento seleccionado
-            indice_seleccionado = opciones.index(seleccion)
-            medicamento = resultados.iloc[indice_seleccionado]
+            # Variables para sumar los totales
+            inversion_total = 0
+            beneficio_total_ideal = 0
+            beneficio_total_competidor = 0
+            ingreso_total_competidor = 0
             
-            if pd.isna(medicamento['COSTO_MINIMO']) or pd.isna(medicamento['FARMATODO']):
-                st.error("⚠️ Este medicamento no tiene los precios completos en el sistema para comparar.")
+            resultados_detallados = []
+            alertas_rojas = []
+            
+            # Calcular fila por fila
+            for idx, row in df_editado.iterrows():
+                costo_u = row['Costo Unit. ($)']
+                precio_f = row['Precio Farmatodo ($)']
+                cantidad = row['Cantidad']
+                margen_pct = row['Margen Deseado (%)'] / 100
+                
+                costo_total_prod = costo_u * cantidad
+                precio_ideal_u = costo_u / (1 - margen_pct)
+                beneficio_ideal_prod = (precio_ideal_u * cantidad) - costo_total_prod
+                
+                beneficio_farma_prod = (precio_f * cantidad) - costo_total_prod
+                ingreso_farma_prod = precio_f * cantidad
+                
+                # Sumar a los totales globales
+                inversion_total += costo_total_prod
+                beneficio_total_ideal += beneficio_ideal_prod
+                beneficio_total_competidor += beneficio_farma_prod
+                ingreso_total_competidor += ingreso_farma_prod
+                
+                # Revisar si hay pérdida
+                estado = "✅ Ok"
+                if precio_f <= costo_u:
+                    estado = "🚨 PÉRDIDA"
+                    alertas_rojas.append(row['Medicamento'])
+                elif beneficio_farma_prod < beneficio_ideal_prod:
+                    estado = "⚠️ Margen Reducido"
+                else:
+                    estado = "🎉 Mayor Ganancia"
+                
+                # Guardar el detalle de la fila
+                resultados_detallados.append({
+                    'Medicamento': row['Medicamento'],
+                    'Tu Precio Sugerido': f"${precio_ideal_u:.2f}",
+                    'Tu Beneficio Ideal': f"${beneficio_ideal_prod:.2f}",
+                    'Beneficio vs Farmatodo': f"${beneficio_farma_prod:.2f}",
+                    'Estado': estado
+                })
+            
+            # --- MOSTRAR RESULTADOS GLOBALES ---
+            st.divider()
+            st.subheader("📊 RESUMEN GLOBAL DEL PEDIDO")
+            
+            # Cálculos de KPI Globales
+            diferencia_global = beneficio_total_competidor - beneficio_total_ideal
+            margen_real_global = (beneficio_total_competidor / ingreso_total_competidor) * 100 if ingreso_total_competidor > 0 else 0
+            
+            # Tarjetas de resumen (Métricas grandes)
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Inversión Total (Costo)", f"${inversion_total:.2f}")
+            k2.metric("Beneficio Ideal Esperado", f"${beneficio_total_ideal:.2f}")
+            
+            if beneficio_total_competidor < 0:
+                k3.metric("Beneficio Real (vs Farmatodo)", f"${beneficio_total_competidor:.2f}", "PÉRDIDA", delta_color="inverse")
             else:
-                # 3. Mostrar Datos Base
-                st.info(f"**Mejor Proveedor:** {medicamento['MEJOR_PROVEEDOR']} | **Costo Unitario:** ${medicamento['COSTO_MINIMO']:.2f} | **Precio Farmatodo:** ${medicamento['FARMATODO']:.2f}")
-                
-                # 4. Inputs del usuario (Columnas)
-                col1, col2 = st.columns(2)
-                with col1:
-                    cantidad = st.number_input("📦 Cantidad estimada a vender:", min_value=1, value=30)
-                with col2:
-                    margen = st.number_input("📈 Margen de ganancia deseado (%):", min_value=1.0, value=30.0) / 100
-                
-                # Botón de calcular
-                if st.button("Calcular Estrategia", type="primary"):
-                    costo_u = medicamento['COSTO_MINIMO']
-                    precio_f = medicamento['FARMATODO']
-                    
-                    # Cálculos
-                    precio_ideal = costo_u / (1 - margen)
-                    costo_total = costo_u * cantidad
-                    beneficio_ideal = (precio_ideal * cantidad) - costo_total
-                    
-                    beneficio_competidor = (precio_f * cantidad) - costo_total
-                    margen_competidor_pct = (beneficio_competidor / (precio_f * cantidad)) * 100 if (precio_f * cantidad) > 0 else 0
-                    
-                    # 5. Mostrar Resultados en Tarjetas Visuales
-                    st.divider()
-                    st.subheader("📊 Resultados de la Comparación")
-                    
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.markdown("### 🟢 Tu Escenario Ideal")
-                        st.metric("Precio Sugerido", f"${precio_ideal:.2f}")
-                        st.metric("Beneficio Total Esperado", f"${beneficio_ideal:.2f}")
-                        
-                    with c2:
-                        st.markdown("### 🔴 Igualando a Farmatodo")
-                        st.metric("Precio Farmatodo", f"${precio_f:.2f}")
-                        if beneficio_competidor < 0:
-                            st.error(f"Beneficio Total: ${beneficio_competidor:.2f} (PÉRDIDA)")
-                        else:
-                            st.metric("Beneficio Total", f"${beneficio_competidor:.2f}")
-                        st.metric("Margen Real", f"{margen_competidor_pct:.2f}%")
-                    
-                    # 6. Análisis de Impacto
-                    st.divider()
-                    st.subheader("⚖️ Conclusión de Impacto")
-                    
-                    if precio_f < precio_ideal:
-                        if precio_f <= costo_u:
-                            st.error("🚨 **ALERTA ROJA:** Farmatodo vende más barato que el costo de tu proveedor. No compitas en precio aquí.")
-                        else:
-                            perdida_dinero = beneficio_ideal - beneficio_competidor
-                            caida_pct = (perdida_dinero / beneficio_ideal) * 100
-                            st.warning(f"⚠️ Al igualar el precio, tu beneficio cae un **{caida_pct:.1f}%**.")
-                            st.warning(f"💸 Estás dejando de ganar **${perdida_dinero:.2f}** en esta venta.")
-                    elif precio_f > precio_ideal:
-                        ganancia_extra = beneficio_competidor - beneficio_ideal
-                        st.success(f"🎉 **¡Oportunidad!** Farmatodo es más caro. Si igualas su precio ganarás **${ganancia_extra:.2f}** extra.")
-                    else:
-                        st.info("Tu precio ideal es exactamente igual al de Farmatodo.")
+                k3.metric("Beneficio Real (vs Farmatodo)", f"${beneficio_total_competidor:.2f}", f"{margen_real_global:.1f}% Margen Global")
+            
+            if diferencia_global < 0:
+                k4.metric("Dinero dejado en la mesa", f"${diferencia_global:.2f}", "Si igualas precio", delta_color="inverse")
+            else:
+                k4.metric("Ganancia Extra", f"+${diferencia_global:.2f}", "Farmatodo es más caro", delta_color="normal")
+            
+            # Alertas
+            if alertas_rojas:
+                st.error(f"**🚨 ALERTA ROJA:** Los siguientes productos te generarán **pérdida de dinero** si igualas a Farmatodo porque venden por debajo de tu costo: {', '.join(alertas_rojas)}")
+            elif diferencia_global < 0:
+                st.warning(f"⚠️ **Conclusión Estratégica:** Si decides competir en precio igualando a Farmatodo en todo este pedido, dejarás de ganar **${abs(diferencia_global):.2f}**. Tu margen global bajará a **{margen_real_global:.1f}%**.")
+            else:
+                st.success("🎉 **¡Excelente!** En el balance global de este pedido, ganas más dinero que con tu escenario ideal si igualas los precios de Farmatodo.")
+
+            # --- MOSTRAR TABLA DE DETALLES ---
+            st.markdown("### 🔍 Detalle por Fármaco")
+            df_resultados = pd.DataFrame(resultados_detallados)
+            st.dataframe(df_resultados, hide_index=True, use_container_width=True)
